@@ -1,130 +1,214 @@
 #!/usr/bin/env nu
 
-# Set your configuration here!
 
-const USERS: list<string> = [ ]
-# A list of the usernames to terminate upon exceeding time limits.
-# Other users will remain unaffected.
-# Examples:
-# - ['alice']
-# - ['bob' 'carl' 'dan']    
-# Note that there's no comma between list items!
 
-const ALLOWED_TIMES = [
-    "05.00 - 22.00"
-]
-# Time ranges in which the device can be used. Example:
-# [
-#    "8.00 - 12.30"
-#    "13.35 - 17.50"
-# ]
-# An empty list means the device is blocked at all times.
+# The workflow:
+# 
+# 1. We start off at offline mode. We are constantly trying to get clock data from google.com
+#   The only check that is run is the offline time check.
+#   The reason is system clock can not be trusted, as it can be altered by the user through the OS or BIOS.
+# 
+# 2. Once we get the clock data from google.com, we are in the online mode, where all other checks happen.
 
-const TIMEZONE: string = ""
-# Your timezone. See a list of timezones by running this script with: 
-# ./screentime.nu list-timezones
-# Example: "Europe/London"
+let data_dir: path = '/var/lib/screentimer/' | path expand
+let config_file: path = '/etc/screentimer/config.toml' | path expand
 
-const MAX_OFFLINE: duration = 3min
-# Maximum allowed offline usage time per day.
-
-const EXTRA_MINS: duration = 10min
-# Maximum allowed extra time per day outside of $ALLOWED_TIMES you have defined.
-
-# That's it! You can also change the following optional settings:
-
-const LIMIT_RESET_HOUR: string = "5am"
-# The hour at which the extra time and offline time limit counters reset every day.
-
-const DIR: path = '/var/lib/screentime-nixos'
-# The directory in which data files are saved.
-
-# The duration after boot in which time limits are disabled.
-const AFTER_BOOT: duration = 90sec
-
------------------------------------------------------------
-
-mkdir $DIR
-
-let data_file: path = ($DIR | path join 'data.nuon')
-if not ($data_file | path exists) {
-	{ 
-		extra: 0min, 
-		offline: 0min,
-		# offline_block_counter: 0,
-		# Offline block counter was a strategy used to deal with intermittent network connections on Wi-Fi. 
-		# At the moment there are no known users facing this issue, but I'm keeping it commented out just in case.
-		last_reset: ($LIMIT_RESET_HOUR | into datetime | into int)
-	} | save $data_file
+let optionals = {
+    allowed_times: null,
+    extra_time: null,
+    total_time: null,
+    offline_time: null,
 }
+
+if not ($config_file | path exists) {
+    print -e $"Error: No configuration file found at path ($config_file)"
+    exit 1
+}
+
+let config = (
+    $optionals 
+    | merge (open $config_file)
+    | update allowed_times {if $in != null {parse-allowlist}}
+)
+
+mkdir $data_dir
+let db_file: path = ($data_dir | path join 'db.sqlite')
+
+# SQLite database initialization
+let conversions_from_db = {
+    spent_offline: {into duration}
+    spent_extra: {into duration}
+    spent_total: {into duration}
+    last_reset: {into datetime}
+}
+
+if ($db_file | path exists) {
+    stor import --file-name $db_file
+} else {
+    stor create -t db -c {spent_extra: int, spent_total: int, spent_offline: int, last_reset: int}
+    stor insert -t db -d {spent_extra: 0, spent_total: 0, spent_offline: 0, last_reset: ($config.day_start | into datetime)}
+	stor export --file-name $db_file
+}
+
+def get-var [name: string]: nothing -> any {
+    stor open
+    | query db $"select ($name) from db"
+    | get 0
+    | get $name
+    | do ($conversions_from_db | get $name)
+}
+
+def set-var [name: string, value: any]: nothing -> nothing {
+    stor update -t db -u {$name: ($value | into int)}
+    ignore
+}
+
+alias save-to-disk = stor export --file-name $db_file
 
 def main []: nothing -> nothing {
-	# alias notify = try { notify -a "screentime-nixos" -s "1 minute left to termination" -t "Your user session will be terminated in 60 seconds." --timeout 60sec }
-	# notify
-
-	let allowed_times = $ALLOWED_TIMES | process-allowlist
-	let last_reset = (v last_reset | into datetime)
-	mut next_reset = $last_reset + 1day
-
-	loop {
-		let online: bool = (
-			ping -c 5 8.8.8.8
-			| complete
-			| $in.exit_code == 0
-		)
-		if $online {
-			if not (is-time-allowed "now" $allowed_times) {
-				set extra ((v extra) + 1min)	
-				if (v extra) == 1min or (v extra) > $EXTRA_MINS {
-					block
-				} else if (v extra) == $EXTRA_MINS {
-					# notify
-				}
-			}
-			if (date now) > $next_reset {
-				set last_reset ($next_reset | into int)
-				$next_reset = $next_reset + 1day
-				set extra 0min
-				set offline 0min
-			}
-		} else if not $online {
-			set offline ((v offline) + 1min)
-			if (v offline) > $MAX_OFFLINE {
-				# if (v offline_block_counter) >= 3 {
-				# 	set offline_block_counter 0
-					block
-				# } else {
-				# 	set offline_block_counter ((v offline_block_counter) + 1)
-				# }
-			} else if (v offline) == $MAX_OFFLINE {
-				# notify
-			}
-		}
-		sleep (1min - (4sec + 40ms)) # every interval between pings take 1.01 seconds and we ping 5 times.
-		# sleep 100ms # for testing
-	}
+    mut now_minus_uptime: datetime = (0 | into datetime);
+    
+    # All screen time restriction checks are defined here.
+    # Checks with higher priority override the result of checks with lower priority.
+    # The results of checks with the same priority are OR'ed. This means if any one check results in block decision, the system is blocked.
+    let checks: table<id: string, priority: int, condition: closure block: closure, increment: closure, db-key: string> = [
+        {
+            id: 'offline-time',
+            priority: 3
+            condition: {||}
+            block: {||}
+            db-key: 'spent_offline'
+            increment: {||}
+        }
+        {
+            id: 'allowed-time'
+            priority: 1
+            condition: {||}
+            block: {||}
+        }
+        {
+            id: 'total-time'
+            priority: 1
+            condition: {||}
+            block: {||}
+            increment: {||}
+            db-key: 'spent_total'
+        }
+        {
+            id: 'extra-time'
+            priority: 2
+            condition: {||}
+            block: {||}
+            increment: {||}
+            db-key: 'spent_extra'
+        }
+    ]
+    
+    loop {
+        let now = (try {
+            http head https://google.com  
+            | transpose -rd
+            | get date
+            | into datetime
+        })
+        
+        if $now != null {
+            $now_minus_uptime = $now - (sys host).uptime
+            break
+        } else if $now == null {
+            if $config.offline_time == true {
+                set-var spent_offline ((get-var spent_offline) + 1min)
+                if (get-var spent_offline) > $config.offline_time { block }
+            } else if $config.offline_time == false { block }
+        }
+        save-to-disk
+        sleep 1min
+    }
+    
+    # TODO how do we account for timezone?
+    # TODO the issue of needing to reboot times unopened days should be resolved.
+    # TODO notify should work, use libnotify (notify-send)
+    # TODO move on from using db to variable in the 20sec loop. only the save-to-disk loop should be concerned with db at all.
+    
+    # Save the database to disk every minute.
+    job spawn { loop {
+        save-to-disk
+        sleep 1min
+    }}
+    
+    # The loop that runs every 20 seconds, for the rest of the stuff.
+    loop {
+        checks | each {|check|
+            if ($check.db-key? != null) {
+                if (do $check.increment) {
+                    set-var $check.db-key ((get-var $check.db-key) + 1)
+                }
+            }
+        }
+        sleep 20sec
+    }
+    
+    ignore
 }
+
+# def main []: nothing -> nothing {
+# 	# alias notify = notify-send -a "screentime-nixos" -s "1 minute left to termination" -t "Your user session will be terminated in 60 seconds." --timeout 60sec
+# 	# notify
+
+# 	let allowed_times = $config.allowed_times | parse-allowlist
+# 	let last_reset = (v last_reset | into datetime)
+# 	mut next_reset = $last_reset + 1day
+
+# 	loop {
+# 		let online: bool = (
+# 			ping -c 5 8.8.8.8
+# 			| complete
+# 			| $in.exit_code == 0
+# 		)
+# 		if $online {
+# 			if not (is-time-allowed "now" $allowed_times) {
+# 				set extra ((v extra) + 1min)	
+# 				if (v extra) == 1min or (v extra) > $EXTRA_MINS {
+# 					block
+# 				} else if (v extra) == $EXTRA_MINS {
+# 					# notify
+# 				}
+# 			}
+# 			if (date now) > $next_reset {
+# 				set last_reset ($next_reset | into int)
+# 				$next_reset = $next_reset + 1day
+# 				set extra 0min
+# 				set offline 0min
+# 			}
+# 		} else if not $online {
+# 			set offline ((v offline) + 1min)
+# 			if (v offline) > $MAX_OFFLINE {
+# 				# if (v offline_block_counter) >= 3 {
+# 				# 	set offline_block_counter 0
+# 					block
+# 				# } else {
+# 				# 	set offline_block_counter ((v offline_block_counter) + 1)
+# 				# }
+# 			} else if (v offline) == $MAX_OFFLINE {
+# 				# notify
+# 			}
+# 		}
+# 		sleep (1min - (4sec + 40ms)) # every interval between pings take 1.01 seconds and we ping 5 times.
+# 		# sleep 100ms # for testing
+# 	}
+# }
 
 def "main list-timezones" []: nothing -> table<timezone: string> {
 	date list-timezone
 }
 
-def "set" [field: string, value: any]: nothing -> nothing {
-	open $data_file | update $field $value | save -f $data_file
-}
-
-def v [field: string]: nothing -> any {
-	open $data_file | get $field
-}
-
 def block []: nothing -> nothing {
 	# print "User is blocked." ; exit # for testing
-	if (sys host).uptime >= $AFTER_BOOT {
-		$USERS  | each {
+	if (sys host).uptime >= $config.after_boot_allowed {
+		$config.users  | each {
 			let user: string = $in
 			print $"User \"($user)\" is terminated."
 			try { loginctl kill-user $user }
-			try { systemctl suspend }
 		}
 	}
 }
@@ -148,8 +232,8 @@ def parse-expect [regex]: string -> list<any> {
     } else { }
 }
 
-# Process a list of time range strings into a table
-def process-allowlist []: list<string> -> table<start: duration, end: duration> {
+# Parse a list of time range strings into a table
+def parse-allowlist []: list<string> -> table<start: duration, end: duration> {
 	each {|str|
 		str trim
 		| parse-expect '(?<start>\S+)\s*-\s*(?<end>\S+)'
@@ -164,7 +248,7 @@ def process-allowlist []: list<string> -> table<start: duration, end: duration> 
 	}
 }
 
-# Check whether the current hour is in the allowed times
+# Check whether the given hour is in the allowed times
 def is-time-allowed [test_hour: string, allowlist: table<start: duration, end: duration>]: nothing -> bool {
 	let hour = (
 		if $test_hour == 'now' {
@@ -188,7 +272,7 @@ export def test [] {
 	| each {|e|
 		let test = $e.item
 		let ind = $e.index | $" ($in):" | fill -w 4
-		let allowed_hours = $test.allowlist | process-allowlist
+		let allowed_hours = $test.allowlist | parse-allowlist
 		let result = is-time-allowed $test.hour $allowed_hours
 		if $result != $test.expected {
 			print $"\n($ind) FAIL: expected ($test.expected) but got ($result)\n"
