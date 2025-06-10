@@ -1,4 +1,4 @@
-# Set your configuration here!
+[config]
 
 users = [
     "username",
@@ -6,6 +6,16 @@ users = [
 ]
 # List of users to include in blocking.
 # Users not listed here remain unaffected.
+ 
+timezone = "Europe/London"
+# Your timezone. 
+# For a full list of available timezones, run the script: ./screentimer.nu list-timezones
+
+day_start = "4am"
+# The time of day at which usage counters reset.
+# It's recommended to keep this unchanged.
+
+[checks]
 
 allowed_times = [
     "05:00 - 20:00", 
@@ -13,10 +23,6 @@ allowed_times = [
 # Allowed usage time ranges during the day. You can specify multiple ranges.
 # Comment it out to disable time range based blocking.
 # Are you productive after 8pm?
-
-timezone = "Europe/London"
-# Your timezone. 
-# For a full list of available timezones, run the script: ./screentimer.nu list-timezones
 
 extra_time = "10min"
 # Maximum extra allowed usage time per day, outside of all other limits.
@@ -28,16 +34,12 @@ total_time = "6hr"
 # Comment it out to disable total time counting.
 # Are you productive after 6 hours, or is it better for you to take a walk instead?
 
-day_start = "4am"
-# The time of day at which usage counters reset.
-# It's recommended to keep this unchanged.
-
 offline_time = "15min"
 # Maximum allowed offline usage time per day (usage without connectivity).
 # Comment it out to completely disable offline usage.
 # It's recommended to keep this unchanged.
 
-after_boot_allowed = "2min"
+after_boot = "2min"
 # Duration after system boot during which all limits are disabled.
 # Useful for connecting to Wi-Fi, logging in to institution networks, etc.
 # It's highly recommended to keep this unchanged.

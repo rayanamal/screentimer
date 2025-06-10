@@ -1,108 +1,251 @@
 #!/usr/bin/env nu
 
+# TODO checks are only run if their key in the config file is set (not null).
+# Ensure priority ladder is short-circuited to not run the block checks down the line
 
+const VERSION = '0.1.0'
 
-# The workflow:
-# 
-# 1. We start off at offline mode. We are constantly trying to get clock data from google.com
-#   The only check that is run is the offline time check.
-#   The reason is system clock can not be trusted, as it can be altered by the user through the OS or BIOS.
-# 
-# 2. Once we get the clock data from google.com, we are in the online mode, where all other checks happen.
+const DATA_DIR = '/var/lib/screentimer'
+const CONFIG_FILE = '/etc/screentimer/config.toml'
+const RUN_PERIOD = 20sec # The period at which the main loop of the application runs.
 
-let data_dir: path = '/var/lib/screentimer/' | path expand
-let config_file: path = '/etc/screentimer/config.toml' | path expand
-
-let optionals = {
-    allowed_times: null,
-    extra_time: null,
-    total_time: null,
-    offline_time: null,
-}
-
+# Get program configuration.
+let config_file: path = $CONFIG_FILE | path expand
 if not ($config_file | path exists) {
     print -e $"Error: No configuration file found at path ($config_file)"
     exit 1
 }
+let config = open $config_file
 
-let config = (
-    $optionals 
-    | merge (open $config_file)
-    | update allowed_times {if $in != null {parse-allowlist}}
-)
+# Screen time restriction checks' implementation is defined below.
+# 
+# All checks must have a configuration value set in the configuration file.
+# If a check's corresponding configuration option is not set, it will not be run.
+#
+# Every check is a record with the following keys:
+#   - key (string): 
+#       The configuration key (in the configuration file) identifying the check.
+# 
+#   - priority (int): 
+#       Priority of the check relative to other checks (see below).
+#       Checks with higher priority overrides the result of the checks with lower priority.
+#       The results of checks with the same priority are OR'ed. 
+#       This means if any one check results in block decision, the system is blocked.
+# 
+#   - state_update (optional) (closure):
+#       Parameters: check parameters (record)
+#       Output: any
+#       A closure to run to update the state variable of this check.
+#       If it returns nothing (null), state variable will not be updated.
+#       Checks can persist data between main loop runs and share data with other checks using their state variable.
+#       State data is not persisted between program runs, e.g. it'll reset when system shuts down.
+# 
+#   - counter (optional) (closure):
+#       Parameters: check parameters (record), all state variables (record)
+#       Output: bool
+#       If given, a time counter will be stored on disk for this check.
+#       All counters are reset at $config.day_start, if it wasn't possible (e.g. because 
+#       the computer was not turned on) they will be reset at the earliest possible time after that.
+# 
+#   - block (closure):
+#       Parameters: check parameters (record), all state variables (record).
+#       Output: bool
+#       A closure to run to determine whether to block the system.
+#       If the output is nothing (null), the check will have no effect on blocking.
+# 
+# Flow of operation is as follows:
+#   1. Run state_update closures of all checks (who have it set).
+#   2. Run counter closures of all checks (who have it set).
+#   3. Run block closures of all checks (who have it set).
+# 
+# Check parameters is a record with the following keys:
+#   - config (any): check configuration value as defined in the configuration file.
+#   - counter (optional) (duration): check counter, if the counter key is defined for the check.
+#   - state (optional) (any): check state variable, if the state_update key is defined for the check.
 
+let checks: table<key: string, priority: int, block: closure, counter: closure, state_update: closure> = [
+    {
+        key: 'offline_time'
+        priority: 4
+        state_update: {|params|
+            let state = $params.state? | default (
+                online: false
+                real_now: null
+                now_minus_uptime: null
+            )
+            let uptime = (sys host).uptime
+            
+            # If we were unable to fetch real clock data,
+            if $state.online == false { 
+                # and only once a minute, 
+                if ($uptime mod 1min) < $RUN_PERIOD {
+                    # try to fetch real clock data.
+                    let now = (try {
+                        http head https://google.com  
+                        | transpose -rd
+                        | get date
+                        | into datetime
+                    })
+                    if $now != null {
+                        $state
+                        | update online true
+                        | update real_now $now
+                        | update now_minus_uptime ($now - $uptime)
+                    }
+                }
+            } else {
+                $state
+                | update real_now ($state.now_minus_uptime + $uptime)
+            }
+        }
+        counter: {|params| not $params.state.online }
+        block: {|params|
+            if not $params.state.online {
+                $params.counter > $params.config
+            }
+        }
+    }
+    {
+        key: 'allowed_times'
+        priority: 1
+        state_update: {|params|
+            if $params.state? == null {
+                
+                let parsed_allowlist = (
+                    $params.config
+                    | each {|str|
+                        str trim
+                        | parse -r '(?<start>\S+)\s*-\s*(?<end>\S+)'
+                        | if ($in | is-empty) {
+                            print -e $"The value provided to 'allowed_times' config option is in an invalid format:\n($in) \n\nIt should be in the format \"08:00 - 16:00\""
+                            exit 1
+                        } else {}
+                        | update cells {
+                            str trim
+                            | str replace -a '.' ':' # Some locales (in theory) delimit hours with a dot instead of a semicolon.
+                            | into datetime
+                            | $in - ("0am" | into datetime)
+                        }
+                        | into record
+                        | if ($in.start > $in.end) {
+                            print -e $"Start time ($in.start) is after end time ($in.end) in the provided input string: ($str)"
+                            exit 1
+                        } else {}
+                    }
+                )
+                
+                { 
+                    is_time_blocked: {|time: datetime|
+                        let hour: duration = $time - ('0am' | into datetime)
+                        $parsed_allowlist
+                        | any {|it|
+                            $hour >= $it.start and $hour <= $it.end
+                        }
+                        | not $in
+                    }
+                }
+            }
+        }
+        block: {|params, states|
+            if $states.offline_time.online {
+                do $params.state.is_time_blocked $states.offline_time.real_now
+            }
+        }
+    }
+    {
+        key: 'total_time'
+        priority: 1
+        state_update: {|params|
+            if params.state? == null {
+                { is_total_exceeded: ($params.counter > $params.config) }
+            }
+        }
+        counter: {|params, states| (
+            let is_time_blocked = do $states.allowed_times.is_time_blocked $states.offline_time.real_now;
+            (not $is_time_blocked) and (not $params.state.is_total_exceeded)
+        )}
+        block: {|params| $params.state.is_total_exceeded }
+    }
+    {
+        key: 'extra_time'
+        priority: 2
+        counter: {|params, states|
+            let is_time_blocked = do $states.allowed_times.is_time_blocked $states.offline_time.real_now;
+            ($is_time_blocked or $states.total_time.is_total_exceeded) and not ($params.counter > $params.config)
+        }
+        block: {|params| $params.counter > $params.config }
+    }
+    {
+        key: 'after_boot'
+        priority: 3
+        block: {
+            (sys host).uptime <
+        }
+    }
+]
+
+# Initialize the data directory.
+let data_dir: path = $DATA_DIR | path expand
 mkdir $data_dir
-let db_file: path = ($data_dir | path join 'db.sqlite')
 
-# SQLite database initialization
-let conversions_from_db = {
-    spent_offline: {into duration}
-    spent_extra: {into duration}
-    spent_total: {into duration}
-    last_reset: {into datetime}
+# Create default data values.
+const SELF_PATH = path self
+let state_summary = (open $SELF_PATH | hash md5) + (open $config_file | hash md5)
+let data_defaults = {
+    counters: (
+        $checks
+        | compact counter 
+        | each {|check| {$check.key: 0min}} 
+        | into record
+    )
+    last_reset: ($config.day_start | into datetime)
+    state_summary: $state_summary
 }
 
-if ($db_file | path exists) {
-    stor import --file-name $db_file
+# Initialize the data file.
+let data_file: path = ($data_dir | path join 'data.nuon')
+if ($data_file | path exists) {
+    open $data_file
+    | if ($in.state_summary != $state_summary) {
+        print "INFO: Current usage data has been reset, because of either an upgrade or a change in the configuration."
+        rm $data_file
+        $data_defaults | save $data_file
+    }
 } else {
-    stor create -t db -c {spent_extra: int, spent_total: int, spent_offline: int, last_reset: int}
-    stor insert -t db -d {spent_extra: 0, spent_total: 0, spent_offline: 0, last_reset: ($config.day_start | into datetime)}
-	stor export --file-name $db_file
+    $data_defaults | save $data_file
 }
-
-def get-var [name: string]: nothing -> any {
-    stor open
-    | query db $"select ($name) from db"
-    | get 0
-    | get $name
-    | do ($conversions_from_db | get $name)
-}
-
-def set-var [name: string, value: any]: nothing -> nothing {
-    stor update -t db -u {$name: ($value | into int)}
-    ignore
-}
-
-alias save-to-disk = stor export --file-name $db_file
 
 def main []: nothing -> nothing {
-    mut now_minus_uptime: datetime = (0 | into datetime);
+    mut now_minus_uptime: datetime = (0 | into datetime);    
+    mut data = open $data_file
     
-    # All screen time restriction checks are defined here.
-    # Checks with higher priority override the result of checks with lower priority.
-    # The results of checks with the same priority are OR'ed. This means if any one check results in block decision, the system is blocked.
-    let checks: table<id: string, priority: int, condition: closure block: closure, increment: closure, db-key: string> = [
-        {
-            id: 'offline-time',
-            priority: 3
-            condition: {||}
-            block: {||}
-            db-key: 'spent_offline'
-            increment: {||}
+    # TODO how do we account for timezone?
+    # TODO the issue of needing to reboot times unopened days should be resolved.
+    # TODO notify should work, use libnotify (notify-send)
+    # TODO handle the case where cross day boundary.
+    
+    # Updates the counter of the given check.
+    # Output: the updated record of counters.
+    def update-counter [check: record, counters: record]: nothing -> record {
+        if $check.counter? != null {
+            if (do $check.counter $counters) { 
+                $counters
+                | update $check.key { $in + $RUN_PERIOD }
+            } else { $counters }
+        } else { $counters }
+    }
+    
+    # Determines whether to block or not, given a list of checks.
+    def determine_block [checks: table, counters: record]: nothing -> bool {
+        $checks
+        | group-by priority --to-table 
+        | sort-by priority --reverse
+        | get items
+        | first 
+        | reduce --fold false {|check, acc|
+            $acc or (do $check.block $counters)
         }
-        {
-            id: 'allowed-time'
-            priority: 1
-            condition: {||}
-            block: {||}
-        }
-        {
-            id: 'total-time'
-            priority: 1
-            condition: {||}
-            block: {||}
-            increment: {||}
-            db-key: 'spent_total'
-        }
-        {
-            id: 'extra-time'
-            priority: 2
-            condition: {||}
-            block: {||}
-            increment: {||}
-            db-key: 'spent_extra'
-        }
-    ]
+    }
     
     loop {
         let now = (try {
@@ -116,37 +259,44 @@ def main []: nothing -> nothing {
             $now_minus_uptime = $now - (sys host).uptime
             break
         } else if $now == null {
-            if $config.offline_time == true {
-                set-var spent_offline ((get-var spent_offline) + 1min)
-                if (get-var spent_offline) > $config.offline_time { block }
-            } else if $config.offline_time == false { block }
-        }
-        save-to-disk
-        sleep 1min
-    }
-    
-    # TODO how do we account for timezone?
-    # TODO the issue of needing to reboot times unopened days should be resolved.
-    # TODO notify should work, use libnotify (notify-send)
-    # TODO move on from using db to variable in the 20sec loop. only the save-to-disk loop should be concerned with db at all.
-    
-    # Save the database to disk every minute.
-    job spawn { loop {
-        save-to-disk
-        sleep 1min
-    }}
-    
-    # The loop that runs every 20 seconds, for the rest of the stuff.
-    loop {
-        checks | each {|check|
-            if ($check.db-key? != null) {
-                if (do $check.increment) {
-                    set-var $check.db-key ((get-var $check.db-key) + 1)
-                }
+            let offline_checks = $checks | filter {$in.online == false}
+            $data.counters = (
+                $offline_checks
+                | reduce --fold $data.counters {|check, counters| 
+                    update-counter $check $counters
+            })
+            if (determine-block $offline_checks $data.counters) {
+                block
             }
+            
+            
+            # if $config.offline_time == true {
+            #     set-var spent_offline ((get-var spent_offline) + 1min)
+            #     if (get-var spent_offline) > $config.offline_time { block }
+            # } else if $config.offline_time == false { block }
         }
-        sleep 20sec
+        save-to-disk
+        sleep 1min
     }
+    
+    # The main loop
+    loop {
+        let uptime = (sys host).uptime # We freeze the moment in time by fetching the current uptime only once in the main loop.
+        
+        # first filter the checks by trusted time
+        # 
+        
+        checks | each {|check|
+            
+        }
+        
+        # Commit to disk every minute.
+        if ($uptime mod 1min) < $RUN_PERIOD {
+            $data | save -f $data_file
+        }
+        sleep $RUN_PERIOD
+    }
+    
     
     ignore
 }
@@ -213,58 +363,6 @@ def block []: nothing -> nothing {
 	}
 }
 
-# Convert a 24-hour clock string to a duration value
-def clock-to-duration []: string -> duration {
-	str trim
-	| str replace -a ':' '.'
-	| parse-expect '(?<hours>\d{1,2}).(?<minutes>\d{2})'
-	| into record
-	| $"($in.hours)hr ($in.minutes)min"
-	| into duration
-}
-
-# Parse a string using a regex and exit with an error message if there are no matches
-def parse-expect [regex]: string -> list<any> {
-	parse -r $regex
-    | if ($in | is-empty) {
-        print -e $'Provided input string "($in)" is in an invalid format. It should conform to the regular expression "($regex)"' 
-        exit 1
-    } else { }
-}
-
-# Parse a list of time range strings into a table
-def parse-allowlist []: list<string> -> table<start: duration, end: duration> {
-	each {|str|
-		str trim
-		| parse-expect '(?<start>\S+)\s*-\s*(?<end>\S+)'
-		| update cells {
-			clock-to-duration
-		}
-		| into record
-		| if ($in.start > $in.end) {
-			print -e $"Start time ($in.start) is after end time ($in.end) in the provided input string: ($str)"
-			exit 1
-		} else {}
-	}
-}
-
-# Check whether the given hour is in the allowed times
-def is-time-allowed [test_hour: string, allowlist: table<start: duration, end: duration>]: nothing -> bool {
-	let hour = (
-		if $test_hour == 'now' {
-			date now
-			| format date "%H.%M"
-		} else {
-			$test_hour
-		}
-		| clock-to-duration
-	)
-	$allowlist
-	| any {|it|
-		$hour >= $it.start and $hour <= $it.end
-	}
-}
-
 # A function to test time allowlist parsing
 export def test [] {
 	open ./tests.nuon
@@ -283,3 +381,10 @@ export def test [] {
 	}
 	ignore
 }
+
+# TODO fix depman
+# TODO write tests for every single functionality and edge case out there using depman. If you don't have tests you don't have hope for maintaining.
+# TODO use version to determine config file upgrade, using semver. Upgrade is a merge operation.
+# TODO implement a version subcommand to print out version.
+# TODO checks are only the ones named in the config file and no more, verification.
+# TODO check whether running with admin privileges (is-admin)
