@@ -15,6 +15,17 @@ day_start = "4am"
 # The time of day at which usage counters reset.
 # It's recommended to keep this unchanged.
 
+offline_time = "15min"
+# Maximum allowed offline usage time per day (usage without access to real clock data fetched from google.com).
+# This is useful to prevent user modifications to OS clock affecting the blocking.
+# Comment it out to disable fetching clock data from network, and instead trust OS clock.
+# It's recommended to keep this unchanged.
+
+after_boot_allowed = "2min"
+# Duration after system boot during which all limits are disabled.
+# Useful for connecting to Wi-Fi, logging in to institution networks, etc.
+# It's highly recommended to keep this unchanged.
+
 [checks]
 
 allowed_times = [
@@ -33,13 +44,3 @@ total_time = "6hr"
 # Once this total is exceeded, further usage is blocked.
 # Comment it out to disable total time counting.
 # Are you productive after 6 hours, or is it better for you to take a walk instead?
-
-offline_time = "15min"
-# Maximum allowed offline usage time per day (usage without connectivity).
-# Comment it out to completely disable offline usage.
-# It's recommended to keep this unchanged.
-
-after_boot = "2min"
-# Duration after system boot during which all limits are disabled.
-# Useful for connecting to Wi-Fi, logging in to institution networks, etc.
-# It's highly recommended to keep this unchanged.
