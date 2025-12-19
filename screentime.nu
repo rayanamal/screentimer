@@ -1,62 +1,114 @@
 #!/usr/bin/env nu
 
+# RIGHT NOW: Rewriting the checks according to new spec, line 171.
+
 # v0.1.0 TODOs
 #
-# TODO implement accurate counter updates (doing http head takes time, that'll create drift over time.)
-# TODO comment offline_time out to disable network fetching and trust OS clock
-# TODO only increment the counter if the user is logged in
-# TODO checks are only run if their key in the config file is set (not null).
+# TODO enable experimental option enforce-runtime-checks
+# TODO implement offline_time in the new system
+# TODO ensure counter updates and real time clock are accuracte 
+# TODO implement parallelization for each layer
+# TODO implement user-configurable checks in config.toml
+# TODO implement syntax checking of user-provided checks' closures with nu-check
+# TODO implement and document how to trust the OS clock
+# TODO a mechanism to only increment the counter if the user is logged in
 # TODO account for timezone
-# TODO the issue of needing to reboot times unopened days should be resolved.
-# TODO notify should work, use libnotify (notify-send)
-# TODO implement day_start
-# TODO handle the case where we cross day boundary.
+# TODO notify should work, you can use libnotify (notify-send)
 # TODO document dependencies (systemd, notify-send)
-# TODO implement specifying different config file
 # TODO implement testing as specified in the bottom
+# TODO implement specifying different config file
+
+# LATER TODOs
+# TODO adopt Nix
+# TODO make it cross-platform
+# TODO implement performance profiling (resource usage warnings for checks etc.)
 
 const VERSION = '0.1.0'
-
-const DATA_DIR = '/var/lib/screentimer'
+const DATA_DIR = '/var/lib/screentimer/dev'
 const CONFIG_FILE = '/etc/screentimer/config.toml'
-const RUN_PERIOD = 30sec # The period at which the main loop of the application runs.
+
+const ITERATION_INTERVAL = 20sec 
+# The duration between the successive iterations of the program loop.
+
+const COMMIT_INTERVAL = 1min 
+# The period at which state data is saved to disk.
 
 # # Restriction checks implementation
 # 
 # Implementing screen time constraints for digital devices is a treacherously complex task. There are many edge cases,
 # and few solutions which result in low cognitive overhead for the system administrator.
 # 
-# Here, you can set screen time checks as records with keys defining their state, time counters 
-# and block conditions in a declarative manner.
-# This design ensures reliability and that checks don't interact with each other in unpredictable ways.
-# For example, if the `state_update` closure of checks had access to the state variables of other checks,
-# it could result in a situation where the order in which checks' state updates are run would matter.
+# You can set screen time checks in a declarative manner.
+# The program loop runs every 20 seconds and processes every check.
+# 
+# ### The program loop
+# 
+#   1. Wait for 20 seconds.
+#   2. Check `state_reset` and `counter_reset` triggers, and reset them if necessary.
+#   3. Run `update_state` closures of the checks who have it set. Update ther states accordingly.
+#   4. Run `condition` closures of the checks who have it set. Filter out the checks which 
+#      return false for the next steps.
+#   5. Run `counter` closures of the checks who have it set. Update their counters accordingly.
+#   6. Run `block` closures of the checks who have it set and collect the results. 
+#   7. Determine whether or not to block the user based on the results and relative priorities
+#      of the checks. If the final result is `true`, terminate the user's session.
+#   8. Go to 1.
+# 
+# ### Don't change any part of the code without first fully understanding the program!
+# 
+# This is a logic-heavy codebase, and there are a lot of footguns because of the problem space. 
+# If you didn't fully understand the principles and reasoning behind this program's operation, 
+# don't change it.
+# 
+# This design ensures reliability and predictability, it ensures that an arbitrary number of 
+# user-provided checks can coexist with each other, without interfering with each other in 
+# unintended ways, all while providing an interface for configuration that remains 
+# easily understandable and easily customizable by humans.
+# 
+# #### Data flow is strictly downwards
+# 
+# In every iteration of the loop, data flows strictly from an upper layer to the next layer (see 
+# the program loop above).
+# There is no data sharing inside a single layer. The only pieces of data that are allowed to 
+# persist between runs are explicitly designated as such: the state variables and the counters.
+#
+# Here's an example of how a seemingly small change that changes this can break the guarantees 
+# we provide:
+# 
+# If the code were changed so that the `update_state` closure of checks had access to the state 
+# variables of other checks from the current iteration, it would result in a situation where the 
+# order in which checks' state updates are run would matter. This would break the ability for 
+# arbitrary checks to coexist.
+# 
+# Similarly, if the `update_state` closure was given access to to the state variables of other 
+# checks form the *previous* iteration, it would increase cross-check state interference and 
+# would result in decreased predictability.
 #
 # ## Check structure
 #   - key (string): 
-#       The configuration key (in the configuration file) identifying the check.
+#       The key in the configuration file identifying the check.
 # 
-#   - priority (int): 
-#       Priority of the check relative to other checks (see below).
-#       Checks with higher priority overrides the result of the checks with lower priority.
-#       The results of checks with the same priority are OR'ed. 
-#       This means if any one check results in block decision, the system is blocked.
-#       Checks with the same type will be grouped together before considering priority.
-#       This means checks with different types won't affect each other.
+#   - enable (optional) (bool):
+#       Whether to enable the check. Defaults to true.
 # 
-#   - type: (string):
-#       Type of the check. Possible values: "online", "offline".
-#       If set to "online", the check will be enabled only after real clock 
-#       data fetched from google.com becomes available.
-#       If set to "offline", the check will only be enabled while real clock
-#       data is not available.
-# 
-#   - state_update (optional) (closure):
+#   - update_state (optional) (closure):
 #       Parameters: check parameters (record)
 #       Output: any
 #       A closure to run to update the state variable of this check.
 #       State variable of the check will be set to the output of this closure.
 #       If it returns nothing (null), state variable will not be updated.
+# 
+#   - state_reset:
+#       If given, the state variable will be reset when this is triggered.
+#       These are the possible options:
+#       - 'on_boot' to reset when screentimer starts up (typically when the computer boots up).
+#       - 'weekly', 'daily', 'monthly'
+#       - A string in the form: 'every {integer} {hour(s)/day(s)/week(s)/year(s)/nu-parseable duration} [starting at {nu-parseable datetime}]'
+# 
+#   - condition (optional) (closure):
+#       Parameters: check parameters (record), all states (record)
+#       Output: bool
+#       A closure predicate to run to determine whether to run the check in this iteration.
 # 
 #   - counter (optional) (closure):
 #       Parameters: check parameters (record), all states (record)
@@ -65,54 +117,69 @@ const RUN_PERIOD = 30sec # The period at which the main loop of the application 
 #       All counters are reset at $config.day_start, if it wasn't possible (e.g. because 
 #       the computer was not turned on) they will be reset at the earliest possible time after that.
 # 
-#   - block (closure):
+#   - counter_reset: (optional) (string):
+#       If given, the counter will be reset when this is triggered.
+#       See the state_reset key for the possible options.
+# 
+#   - block (optional) (closure):
 #       Parameters: check parameters (record), all states (record).
 #       Output: bool
 #       A closure to run to determine whether to block the system.
 #       If the output is nothing (null), the check will have no effect on blocking.
+#
+#   - priority (optional) (int): 
+#       Blocking priority of the check relative to other checks (see below).
+#       Checks with higher priority overrides the block decision of checks with lower priority.
+#       The results of checks with the same priority are OR'ed. 
+#       This means if any one check results in block decision, the system is blocked.
+#       Checks with the same type will be grouped together before considering priority.
+#       This means checks with different types won't affect each other.
 # 
 # ### State variables
-# Checks can persist data between runs and share data with other checks using their state variable.
-# State data is kept in memory and saved to disk. It'll be reset when screentimer stops running (e.g. when the computer shuts down).
+# Checks can persist data between runs and share data with other checks using their state 
+# variable.
+# State data is kept in memory and saved to disk periodically.
 # 
 # ### check parameters (record):
-#   - real_now (optional) (datetime): real clock fetched from the internet, if it's available.
 #   - config (any): this check's configuration value as defined in the configuration file.
 #   - counter (optional) (duration): this check's counter, if the counter key is defined for the check.
-#   - state (optional) (any): this check's state variable, if the state_update key is defined for the check.
+#   - state (optional) (any): this check's state variable, if the update_state key is defined for the check.
 # 
 # ### all states (record):
 # This is a record containing state variables of all checks, with check ids as keys.
-# 
-# ### Disabling checks
-# All checks must have a configuration value set in the configuration file.
-# If a check's corresponding configuration option is not set, it will not be run.
-# 
-# ## Flow of operation:
-# 
-# 1, Run all offline checks while also trying to get fetch clock data from google.com.
-# 2. Once we fetch the real clock data from google.com, stop running offline checks and start running online checks, indefinitely.
-# 
-# ### Trusting the system clock instead of online clock data
-# 
-# If offline_time config option is commented out in the configuration file, screentimer will trust the OS clock instead of 
-# trying to fetch the real clock data from google.com.
-# In this case, all offline checks will be disabled, and only online checks will be run, regardless of whether there's a network connection or not.
-# 
-# ### How checks are run (the program loop)
-#   1. Run state_update closures of checks (who have it set). Update states accordingly.
-#   2. Run counter closures of checks (who have it set). Update counters accordingly.
-#   3. Run block closures of checks (who have it set). Determine whether or not to block the user based on the priority of checks.
-#   4. If the final result is a block decision, and we are not in `after_boot_allowed` config option, terminate the user's session.
-#   5. Wait for a 20 seconds ($RUN_PERIOD).
-#   5. Go to 1.
 
-let checks: table<key: string, priority: int, block: closure, counter: closure, state_update: closure> = [
+let checks: table<key: string, priority: int, block: closure, counter: closure, update_state: closure> = [
+    {
+        key: 'real_time'
+        state_reset: 'on_boot'
+        update_state: {|params|            
+            let uptime = (sys host).uptime
+            let online = $params.state.online? | default false
+            
+            if $online == false {
+                let last_run = $params.state.last_run? | default {0 | into datetime}
+    
+                if ($uptime - $last_run) > 1min {
+                    let now_minus_uptime = try {
+                        http head --max-time 2sec https://google.com
+                        | transpose -rd
+                        | get date
+                        | into datetime
+                        | $in - (sys host).uptime
+                    } catch { null }
+                }
+            } else if $online == true {
+                
+            } else {
+                make-error impossible 'd0bf1267-0741-4818-8d34-09b0224d64cf'
+            }
+        }
+    }
     {
         key: 'allowed_times'
         priority: 1
         type: 'online'
-        state_update: {|params|
+        update_state: {|params|
             if $params.state? == null {
                 let parsed_allowlist = (
                     $params.config
@@ -136,10 +203,9 @@ let checks: table<key: string, priority: int, block: closure, counter: closure, 
                         } else {}
                     }
                 )
-                
                 { parsed_allowlist: $parsed_allowlist }
             } else { $params.state }
-            | upsert is_now_blocked {|state|    
+            | upsert is_now_blocked {|state|
                 let hour: duration = $params.real_now - ('0am' | into datetime)
                 $state.parsed_allowlist
                 | any {|it|
@@ -154,7 +220,7 @@ let checks: table<key: string, priority: int, block: closure, counter: closure, 
         key: 'total_time'
         priority: 1
         type: 'online'
-        state_update: {|params|
+        update_state: {|params|
             { is_total_exceeded: ($params.counter > $params.config) }
         }
         counter: {|params, states| (
@@ -199,7 +265,7 @@ def main [
     let data_defaults = {
         counters: (
             $checks
-            | compact counter 
+            | compact counter
             | each {|check| {$check.key: 0min}} 
             | into record
         )
@@ -220,7 +286,7 @@ def main [
     } else {
         $data_defaults | save $data_file
     }
-
+    
     mut data = open $data_file
     mut online = false
     mut real_now = (0 | into datetime)
@@ -228,13 +294,12 @@ def main [
     mut states = {};
     
     loop {
-        let uptime = (sys host).uptime
-        if ($uptime mod 1min) < $RUN_PERIOD {
-            $data | save -f $data_file
-        }
+        let a_new_minute = ((sys host).uptime mod 1min) < $ITERATION_INTERVAL
+        
+        if $a_new_minute { $data | save -f $data_file }
         alias run-checks = run-checks $real_now $config $data.counters $states
         if $online == false {
-            if ($uptime mod 1min) < $RUN_PERIOD {
+            if $a_new_minute {
                 let now = (try {
                     http head https://google.com
                     | transpose -rd
@@ -242,12 +307,12 @@ def main [
                     | into datetime
                 })
                 if $now != null {
-                    $now_minus_uptime = $now - $uptime
+                    $now_minus_uptime = $now - (sys host).uptime
                     $online = true
                 }
             }
             if ($data.offline_time > $config.offline_time) { block }
-            $data.offline_time = $data.offline_time + $RUN_PERIOD
+            $data.offline_time = $data.offline_time + $ITERATION_INTERVAL
             let results = run-checks ($checks | where type == offline)
             $data.counters = $results.counters
             $states = $results.states
@@ -256,7 +321,7 @@ def main [
             $data.counters = $results.counters
             $states = $results.states
         }
-        sleep $RUN_PERIOD
+        sleep $ITERATION_INTERVAL
     }
     ignore
 }
@@ -269,7 +334,7 @@ def run-checks [real_now: datetime, config: record, counters: record, states: re
         $states 
         | merge (
             $checks
-            | filter {$in has state_update}
+            | where {$in has update_state}
             | each {|check|
                 let check_params = {
                     real_now: $real_now
@@ -278,7 +343,7 @@ def run-checks [real_now: datetime, config: record, counters: record, states: re
                     state: ($states | get $check.id)
                 }
                 
-                { $check.id: (do $check.state_update $check_params) }
+                { $check.id: (do $check.update_state $check_params) }
             }
             | into record
     ))
@@ -287,7 +352,7 @@ def run-checks [real_now: datetime, config: record, counters: record, states: re
         $counters 
         | merge (
             $checks
-            | filter {$in has counter}
+            | where {$in has counter}
             | each {|check|
                 let check_params = {
                     real_now: $real_now
@@ -299,7 +364,7 @@ def run-checks [real_now: datetime, config: record, counters: record, states: re
                     $counters 
                     | get $check.id
                     | if (do $check.counter $check_params $states) {
-                         $in + $RUN_PERIOD
+                         $in + $ITERATION_INTERVAL
                     } else {}
                 )
                 { $check.id: $new_counter }
@@ -325,7 +390,7 @@ def run-checks [real_now: datetime, config: record, counters: record, states: re
                 }
                 do $check.block $check_params $states
             }
-            | filter {$in != null} 
+            | where {$in != null} 
             | if ($in | is-not-empty) { 
                 reduce --fold false {|it, acc| $acc or $it } 
             }
@@ -402,6 +467,29 @@ def block []: nothing -> nothing {
 	
 }
 
+# Create an error with a Github issue link for a situation that should never have happened, 
+# like an inexhaustive match that was thought to be exhaustive.
+def "make-error impossible" [
+    uuid: string # A v4 UUID. Can be obtained by `random uuid` command.
+] {
+    let title = $"Runtime error: ($uuid | split row '-' | first)" | url encode
+    let body = $"
+An unknown error has occurred during runtime.
+
+`screentimer` version: ($VERSION)
+`nu` version: (version | get version)
+Issue UUID: ($uuid)
+
+Briefly describe what happened:
+" | url encode
+    let url = $"https://github.com/rayanamal/screentimer/issues/new?title=($title)&body=($body)"
+    make-error $"An unknown error has occurred. We're sorry. Please click (ansi u)($url | ansi link --text 'here')(ansi reset) to report it so that it can be fixed."
+}
+
+# Create an error with a reason.
+def make-error [reason: string] {
+    error make --unspanned { msg: $reason }
+}
 
 # Later TODOs
 
