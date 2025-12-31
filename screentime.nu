@@ -1,11 +1,10 @@
 #!/usr/bin/env nu
 
-# RIGHT NOW: Rewriting the rules according to new spec, line 156, adding new keys to the definition, on t
+# RIGHT NOW: line 167, after_boot
 
 # # v0.1.0 TODOs
 #
-# TODO add depends= key
-# TODO implement offline_time, after_boot_allowed in the new system
+# TODO implement after_boot_allowed in the new system
 # TODO implement counter_reset, state_reset. day start is 4am. you can use the real_time check for it, don't depend on systemd please
 # TODO a mechanism to only increment the counter if the user is logged in
 # TODO implement and document how to trust the OS clock
@@ -20,15 +19,23 @@
 #
 # LATER TODOs
 #
+# TODO only pass the state variables of the rules explicitly stated dependencies
+# TODO explicitly register and initialize state variables, like ESPHome globals
+# TODO implement until= and after= keys to specify timestamps for when rules should run
+# TODO adopt Nix
+# TODO support configuring through NixOS module (per-specialization rules enabling)
+# TODO support configuration hotreloading (call a templated systemd service to change configurations)
 # TODO implement specifying which rules apply to which users
 # TODO implement parallelization for each layer
-# TODO implement custom rules in using nu modules and export/use
+# TODO implement custom rules using nu modules and export/use
 # TODO implement syntax checking of user-provided custom rules with nu-check
 # TODO trigger on logins too (watch logins file or similar)
-# TODO adopt Nix
-# TODO make it cross-platform
-# TODO installation instructions for Linux, Windows, MacOS
+# TODO integrate Chromium settings (wrap Chromium in your module, overlay or whatever)
+# TODO reverse DNS firewall, integrated with (but independent of) screentimer
+# TODO community created whitelists and blacklists
+# TODO make it cross-platform. Other platforms including Linux will necessarily lack almost all features, like specializations and the ability to pair with Chromium lists. It's basically meant as a try-on gateway drug to our NixOS config.
 # TODO implement performance profiling (resource usage warnings for rules etc.)
+# TODO rewrite in Rust, bundle everything into a single executable
 
 const VERSION = '0.1.0'
 const DATA_DIR = '/var/lib/screentimer/dev'
@@ -40,7 +47,7 @@ const ITERATION_INTERVAL = 20sec
 const COMMIT_INTERVAL = 1min
 # The period at which state data is saved to disk.
 
-let rules: table<key: string, enable: bool, update_state: closure, state_reset: record, priority: int, block: closure, counter: closure, > = [
+let rules: table<key: string, enable: bool, update_state: closure, state_reset: record<on: string, condition: closure>, counter: closure, counter_reset: record<on: string, condition: closure>, block: closure, priority: int> = [
     {
         key: 'real_time'
         state_reset: 'on_boot'
@@ -76,7 +83,8 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
     {
         key: 'allowed_times'
         priority: 1
-        condition: {|params| $params.rule_states.real_time.now? != null }
+        dependencies: [ 'real_time' ]
+        condition: {|params| $params.rule_states.real_time.online? | default false }
         update_state: {|params|
             let now: datetime = $params.rule_states.real_time.now;
             $params.state | default {
@@ -122,27 +130,51 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
             { exceeded: ($params.counter > $params.config) }
         }
         counter: {|params|
-            let outside = $params.states.allowed_times?.outside? | default false
+            let outside = $params.rule_states.allowed_times?.outside? | default false
             (not $outside) and (not $params.state.exceeded)
         }
         block: {|params| $params.state.exceeded }
     }
+    
     # Extra time rule.
-    # If both allowed_times and total_time rules don't exist this rule shouldn't run.
     {
         key: 'extra_time'
         priority: 2
-        condition: {|params| $params.states.total_time.exceeded? != null }
+        dependencies: [ 'real_time', 'total_time', 'allowed_times' ]
+        condition: {|params| $params.rule_states.real_time.online? | default false }
         counter: {|params|
-                let total_exceeded = $params.states.total_time.exceeded? | default false
-                let outside_allowed = $params.states.allowed_times?.outside? | default false
+                let total_exceeded = $params.rule_states.total_time.exceeded? | default false
+                let outside_allowed = $params.rule_states.allowed_times.outside? | default false
                 ($outside_allowed or $total_exceeded) and not ($params.counter > $params.config)
         }
         block: {|params| $params.counter > $params.config }
     }
+    
+    # Offline extra time rule.
+    {
+        key: 'offline_extra_time'
+        priority: 2
+        dependencies: [ 'total_time', 'allowed_times' ]
+        condition: {|params| not ($params.rule_states.real_time?.online? | default false) }
+        counter: {|params|
+                let total_exceeded = $params.rule_states.total_time.exceeded? | default false
+                let outside_allowed = $params.rule_states.allowed_times.outside? | default false
+                ($outside_allowed or $total_exceeded) and not ($params.counter > $params.config)
+        }
+        block: {|params| $params.counter > $params.config }
+    }
+    
+    # After boot allowed time rule.
+    {
+        key: 'after_boot'
+        priority: 3
+        condition: { (sys host).uptime 
+            
+        }
+    }
 ]
 
-# An utility to manage screen time controls.
+# A utility to manage screen time controls.
 # For more info: https://github.com/rayanamal/screentimer
 def main [
     --config-file (-c): path # Specify an alternative configuration file.

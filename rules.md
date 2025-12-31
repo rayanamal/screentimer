@@ -45,13 +45,16 @@ Similarly, if the `update_state` closure was given access to to the state variab
  
   - `enable` (optional) (`bool`):
       Whether to enable the rule. Defaults to true.
+    
+  - `dependencies` (optional) (`list<string>`):
+      The list of other rules this rule depends on. If the specified rules are not enabled, this rule will not run.
  
   - `update_state` (optional) (`closure`):
       Parameters: rule parameters (`record`)
       Output: `any`
       A closure to run to update the state variable of this rule.
       State variable of the rule will be set to the output of this closure.
-      If it returns nothing (null), state variable will not be updated.
+      If it returns `null`, state variable will not be updated.
  
   - `state_reset` (optional) (`record`):
       If given, the state variable will be reset when this is triggered.
