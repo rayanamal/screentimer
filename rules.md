@@ -1,14 +1,13 @@
 # Restriction rules implementation
 
-Implementing screen time constraints for digital devices is a treacherously complex task. There are many edge cases, and few solutions which result in low cognitive overhead for the system administrator and the user. Thus, this program was designed around three goals (in the order of priority):
+Implementing screen time constraints for digital devices is a problem with high inherent complexity. There are many edge cases, and few solutions which result in low cognitive overhead for both the system administrator and the user. Thus, this program was designed around three goals (in this order of priority):
 
-1. Ensure reliability and predictability
-  - Screen time rules shouldn't interact in hard to predict ways or fail to run as specified.
-2. Eliminate common footguns in specifying rules
-  - Make achieving intended effect obvious and simple and make unintended consequences hard or impossible to express
+1. Ensure correctness
+  - Screen time rules should always run as specified.
+2. Ensure predictability
+  - Screen time rules should behave intuitively and predictably. Rules shouldn't interact in hard to predict ways.
 3. Simplify the end-user configuration interface
-
-You can set screen time rules in a declarative manner. The program loop runs every 20 seconds and processes the rules.
+  - Provide a simple configuration interface for both technical users and normal users.
 
 ### The program loop
  
@@ -37,14 +36,16 @@ Here's an example of how a seemingly small change that affects data flow can bre
  
 If the code were changed so that the `update_state` closure of rules had access to the state variables of other rules from the current iteration, it would result in a situation where the order in which rules' state updates are run would matter. This would break the ability for arbitrary rules to coexist.
 
-Similarly, if the `update_state` closure was given access to to the state variables of other rules form the *previous* iteration, it would increase cross-rule state interference and would result in decreased predictability.
+Similarly, if the `update_state` closure was given access to to the state variables of other rules from the *previous* iteration, it would increase cross-rule state interference and would result in decreased predictability.
 
-## Rule configuration keys
+## Specifying rules
+
+All rules are specified in the `rules/` directory as nu modules.
+
+All rules are disabled by default. The user must enable a rule explicitly by either setting a configuration value or by setting the `enable` key for the rule to `true` in the configuration file.
+
   - `key` (`string`): 
-      The key in the configuration file identifying the rule.
- 
-  - `enable` (optional) (`bool`):
-      Whether to enable the rule. Defaults to true.
+      The key in the configuration file identifying this rule. Also should be the name of the rule module file.
     
   - `dependencies` (optional) (`list<string>`):
       The list of other rules this rule depends on. If the specified rules are not enabled, this rule will not run.
@@ -82,6 +83,7 @@ Similarly, if the `update_state` closure was given access to to the state variab
  
   - `counter_reset` (optional) (`record`):
       - on (`string`):
+          If given, the counter will be reset when this is triggered. 
           See the state_reset key for a list of possible options.
       - condition (optional) (`closure`):
           Parameters: rule parameters (`record`)
@@ -96,7 +98,7 @@ Similarly, if the `update_state` closure was given access to to the state variab
 
   - `priority` (optional) (`int`):
       Blocking priority of the rule relative to other rules (see below).
-      Rules with higher priority overrides the block decision of rules with lower priority.
+      Rules with higher priority override the block decision of rules with lower priority.
       The results of rules with the same priority are OR'ed. 
       This means if any one rule results in block decision, the system is blocked.
  

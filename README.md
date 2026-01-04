@@ -1,21 +1,22 @@
-Screen Time features for NixOS.
+A Screen Time utility for NixOS.
 
-The goal of this project is to turn your general-purpose computing device into a narrow-purpose computing device, a purpose that aligns with your own goals, in order to prevent distractions and maximize productivity. It works extremely well on myself (I have ADHD), your mileage may vary.
-
-It's not a proper Nix package, just some configuration options along with a script.
+Generic Linux is not supported at the moment.
 
 ## Features
 
-- Downtime: Block usage of your computer outside of specified working hours.
-- URL Allowlist: Allow only specified domains in your browser.
+#TODO
 
 ## Requirements
 
 ### 1. Not knowing root password
 
-In order for this system to work properly, you should not know what your root password is. Unfortunately on Linux, a lot of stuff depend on having root access. Fortunately, the stuff you need root access for is *rarely* an emergency. You might be hesitant to make the step, but hey, I'm living just fine without immediate sudo access.
+#TODO rewrite all this considering conf-switcher
 
-In order to not know root password, and yet still be able to be root and do system modifications when a need arises, here's what you need to do:
+In order for this system to work properly, you should not have root access, otherwise you can just disable it, right? Unfortunately on Linux, a lot of stuff depend on having root access. Fortunately, the stuff you need root access for is *rarely* an emergency.
+
+In order to not know root password, and yet still be able to be root and do system modifications when a need arises:
+
+
 
 1. [Timelock](https://github.com/rayanamal/timelock) your root password. Set the decryption time to an amount that'll prevent impulsive behavior. Whenever you want to make a change in your system, you can start decrypting the password. After the decryption is complete, you can do whatever system modifications you want, and then delete back the decrypted password. For most people, 1-6 hours is enough.
 

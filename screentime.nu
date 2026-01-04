@@ -1,20 +1,20 @@
 #!/usr/bin/env nu
 
-# RIGHT NOW: line 167, after_boot
+# RIGHT NOW: rewriting the config.toml file
 
 # # v0.1.0 TODOs
 #
-# TODO implement after_boot_allowed in the new system
-# TODO implement counter_reset, state_reset. day start is 4am. you can use the real_time check for it, don't depend on systemd please
+# TODO implement counter_reset, state_reset. day start is 4am by default. you can use the real_time check for it, don't depend on systemd please
 # TODO a mechanism to only increment the counter if the user is logged in
 # TODO implement and document how to trust the OS clock
-# TODO notify should work, libnotify (notify-send), but not as a hard dependency
-# TODO document dependency (notify-send)
-# TODO implement testing as specified in the bottom
-# TODO installation instructions for NixOS
-# TODO publish as Github release.
+# TODO notify should work, libnotify (notify-send), but not as a hard dependency.
+# TODO implement per day-of-week schedules for relevant rules
 # TODO ensure counter updates and real time clock are accurate
-# TODO support different timezones
+# TODO ensure everything specified in config.toml is implemented (timezones, users=, etc.)
+# TODO bake-in conf-switcher's delayed application feature for screentimer configuration
+#   It's needed because screentimer should be usable outside NixOS and outside Linux
+# TODO rewrite README
+# TODO implement testing as specified in the bottom
 # TODO set as main and publish on Github as a release.
 #
 # LATER TODOs
@@ -39,7 +39,7 @@
 
 const VERSION = '0.1.0'
 const DATA_DIR = '/var/lib/screentimer/dev'
-const CONFIG_FILE = '/etc/screentimer/config.toml'
+const CONFIG_DIR = '/etc/screentimer/'
 
 const ITERATION_INTERVAL = 20sec
 # The duration between the successive iterations of the program loop.
@@ -47,10 +47,23 @@ const ITERATION_INTERVAL = 20sec
 const COMMIT_INTERVAL = 1min
 # The period at which state data is saved to disk.
 
-let rules: table<key: string, enable: bool, update_state: closure, state_reset: record<on: string, condition: closure>, counter: closure, counter_reset: record<on: string, condition: closure>, block: closure, priority: int> = [
+# Type signature: table<key: string, enable: bool, update_state: closure, state_reset: record<on: string, condition: closure>, counter: closure, counter_reset: record<on: string, condition: closure>, block: closure, priority: int>
+
+let default_rule = {
+    key: "default"
+    enable: true
+    update_state: {||}
+    state_reset: { on: "on_boot", condition: {||} }
+    counter: {||}
+    counter_reset: { on: "on_boot", condition: {||} }
+    block: {||}
+    priority: 0
+}
+
+let rules = [
     {
         key: 'real_time'
-        state_reset: 'on_boot'
+        state_reset: { on: "on_boot" }
         update_state: {|params|
             let uptime = (sys host).uptime
             let state = $params.state? | default {}
@@ -66,22 +79,20 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
                             | into datetime
                         )
                         {
-                            now: $now
+                            now: $now,
                             # We fetch the uptime again, because connecting to google.com might have taken some time.
-                            now_minus_uptime: $now - (sys host).uptime,
-                            online: true,
+                            now_minus_uptime: ($now - (sys host).uptime),
+                            online: true
                         }
                     } catch { null }
                 } else { null }
             } else if $online == true {
                 $state | update now {$uptime + $state.now_minus_uptime}
-            } else {
-                make-error impossible 'd0bf1267-0741-4818-8d34-09b0224d64cf'
-            }
+            } else { unreachable 'd0bf1267-0741-4818-8d34-09b0224d64cf' }
         }
     }
     {
-        key: 'allowed_times'
+        key: 'allow_schedule'
         priority: 1
         dependencies: [ 'real_time' ]
         condition: {|params| $params.rule_states.real_time.online? | default false }
@@ -94,7 +105,7 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
                         str trim
                         | parse -r '(?<start>\S+)\s*-\s*(?<end>\S+)'
                         | if ($in | is-empty) {
-                            print -e $"The value provided to 'allowed_times' config option is in an invalid format:\n($in) \n\nIt should be in the format \"08:00 - 16:00\""
+                            print -e $"The value provided to 'allow_schedule' config option is in an invalid format:\n($in) \n\nIt should be in the format \"08:00 - 16:00\""
                             exit 1
                         } else {}
                         | update cells {
@@ -112,10 +123,11 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
                 )}
             }
             | upsert outside {|row|
-                let hour: duration = $now - ('0am' | into datetime)
+                let now_duration: duration = $now - ('0am' | into datetime)
                 $row.parsed_allowlist
+                # If we're not inside of all ranges, then return true
                 | all {|it|
-                    $hour < $it.start or $hour > $it.end
+                    $now_duration < $it.start or $now_duration > $it.end
                 }
             }
         }
@@ -130,35 +142,36 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
             { exceeded: ($params.counter > $params.config) }
         }
         counter: {|params|
-            let outside = $params.rule_states.allowed_times?.outside? | default false
+            let outside = $params.rule_states.allow_schedule?.outside? | default false
             (not $outside) and (not $params.state.exceeded)
         }
         block: {|params| $params.state.exceeded }
     }
     
-    # Extra time rule.
+    # Online extra time rule.
     {
-        key: 'extra_time'
+        key: 'online_extra_time'
         priority: 2
-        dependencies: [ 'real_time', 'total_time', 'allowed_times' ]
+        dependencies: [ 'real_time', 'total_time', 'allow_schedule' ]
         condition: {|params| $params.rule_states.real_time.online? | default false }
         counter: {|params|
                 let total_exceeded = $params.rule_states.total_time.exceeded? | default false
-                let outside_allowed = $params.rule_states.allowed_times.outside? | default false
+                let outside_allowed = $params.rule_states.allow_schedule.outside? | default false
                 ($outside_allowed or $total_exceeded) and not ($params.counter > $params.config)
         }
         block: {|params| $params.counter > $params.config }
     }
     
     # Offline extra time rule.
+    # Unlike the online extra time rule, this rule doesn't have a hard dependency on real_time rule.
     {
         key: 'offline_extra_time'
         priority: 2
-        dependencies: [ 'total_time', 'allowed_times' ]
+        dependencies: [ 'total_time', 'allow_schedule' ]
         condition: {|params| not ($params.rule_states.real_time?.online? | default false) }
         counter: {|params|
                 let total_exceeded = $params.rule_states.total_time.exceeded? | default false
-                let outside_allowed = $params.rule_states.allowed_times.outside? | default false
+                let outside_allowed = $params.rule_states.allow_schedule.outside? | default false
                 ($outside_allowed or $total_exceeded) and not ($params.counter > $params.config)
         }
         block: {|params| $params.counter > $params.config }
@@ -166,13 +179,17 @@ let rules: table<key: string, enable: bool, update_state: closure, state_reset: 
     
     # After boot allowed time rule.
     {
-        key: 'after_boot'
+        key: 'allow_after_boot'
         priority: 3
-        condition: { (sys host).uptime 
-            
+        block: {|params|
+            if (sys host).uptime < $params.config { false }
         }
     }
 ]
+
+$rules | each {|it| typecheck $default_rule | print $it.key $in}
+
+exit
 
 # A utility to manage screen time controls.
 # For more info: https://github.com/rayanamal/screentimer
@@ -181,32 +198,42 @@ def main [
 ]: nothing -> nothing {
 
     # Get program configuration.
-    let config_file: path = $CONFIG_FILE | path expand
+    let config_file: path = $CONFIG_DIR | path expand | path join 'config.toml' 
     if not ($config_file | path exists) {
         print -e $"Error: No configuration file found at path ($config_file)"
         exit 1
     }
     let config = open $config_file | get config
-
-    # Initialize the data directory.
+    
+    # Initialize the data directory and data global variable.
     let data_dir: path = $DATA_DIR | path expand
     let data_file = $data_dir | path join 'data.nuon'
     mkdir $data_dir
-
+    mut data = {};
+        
+    # 1. find out which rules should be run based on their enable= and dependencies=
+    # 2. get into the loop
+    
+    let rules_path: path = $CONFIG_DIR | path expand | path join 'rules/'
+    if ($rules_path | path exists) {
+        ls $rules_path | each {
+            #NEXT 
+        }
+    }
+    
     loop {
         if ((sys host).uptime mod $COMMIT_INTERVAL) < $ITERATION_INTERVAL {
             $data | save -f $data_file
         }
 
-        let results = run-rules
-        $data.counters = $results.counters
-        $states = $results.states
+        # let results = run-rules
+        #TODO update data variable here
         sleep $ITERATION_INTERVAL
     }
     ignore
 }
 
-# Run the given rules, according to the flow of operation defined in the docs
+# Run the given rules, according to the program loop operation defined in the docs
 # Output: new counters and states.
 def run-rules [real_now: datetime, config: record, counters: record, states: record, rules: table] {
 
@@ -296,7 +323,7 @@ def run-rules [real_now: datetime, config: record, counters: record, states: rec
 # 	# alias notify = notify-send -a "screentime-nixos" -s "1 minute left to termination" -t "Your user session will be terminated in 60 seconds." --timeout 60sec
 # 	# notify
 
-# 	let allowed_times = $config.allowed_times | parse-allowlist
+# 	let allow_schedule = $config.allow_schedule | parse-allowlist
 # 	let last_reset = (v last_reset | into datetime)
 # 	mut next_reset = $last_reset + 1day
 
@@ -307,7 +334,7 @@ def run-rules [real_now: datetime, config: record, counters: record, states: rec
 # 			| $in.exit_code == 0
 # 		)
 # 		if $online {
-# 			if not (is-time-allowed "now" $allowed_times) {
+# 			if not (is-time-allowed "now" $allow_schedule) {
 # 				set extra ((v extra) + 1min)
 # 				if (v extra) == 1min or (v extra) > $EXTRA_MINS {
 # 					block
@@ -347,9 +374,8 @@ def block []: nothing -> nothing {
 
 }
 
-# Create an error with a Github issue link for a situation that should never have happened,
-# like an inexhaustive match that was thought to be exhaustive.
-def "make-error impossible" [
+# Create an error with a Github issue link for a situation that should never happen.
+def unreachable [
     uuid: string # A v4 UUID. Can be obtained by `random uuid` command.
 ] {
     let title = $"Runtime error: ($uuid | split row '-' | first)" | url encode
@@ -359,8 +385,6 @@ An unknown error has occurred during runtime.
 `screentimer` version: ($VERSION)
 `nu` version: (version | get version)
 Issue UUID: ($uuid)
-
-Briefly describe what happened:
 " | url encode
     let url = $"https://github.com/rayanamal/screentimer/issues/new?title=($title)&body=($body)"
     make-error $"An unknown error has occurred. We're sorry. Please click (ansi u)($url | ansi link --text 'here')(ansi reset) to report it so that it can be fixed."
@@ -369,6 +393,55 @@ Briefly describe what happened:
 # Create an error with a reason.
 def make-error [reason: string] {
     error make --unspanned { msg: $reason }
+}
+
+# Get the base type of a value provided either as an argument or from the input. 
+# Base types comprise 'list', 'record', and all basic types. Tables are recognized as lists.
+def type-of [value: any]: nothing -> string { ignore
+	$value
+	| describe --detailed
+	| get type
+}
+
+def typecheck [template]: any -> bool {
+    traverse {|it, cell_path|
+        ($template | get -o $cell_path) != null and (type-of $it) == (type-of ($template | get $cell_path))
+    } {|it, cell_path|
+        if (type-of $it) == 'record' { values } else { $in }
+        | all {}
+    }
+}
+
+# Run a closure on every basic value contained in structured values.
+def traverse [
+	closure?: closure               # If given, run this closure on every basic value. Parameters: the input value (any), the cell path (string). Input: the basic value (any).
+	structured_closure? : closure   # If given, run this closure on structured values themselves, after all their children are traversed. Parameters: the input value (any), the cell path (cell-path). Input: the structured value (any).
+]: any -> any {
+	_traverse ($closure | default {{||}}) ($structured_closure | default {{||}}) $.
+}
+
+def _traverse [closure: closure, structured: closure, cell_path: cell-path]: any -> any {
+    let input
+	| match (type-of $in) {
+        'list' => {
+            enumerate
+            | each {|e|
+                let new_path: cell-path = $cell_path | split cell-path | append ($e.index | into cell-path | split cell-path) | into cell-path
+                $e.item | _traverse $closure $structured $new_path
+            }
+            | do $structured $in $cell_path
+        }
+        'record' => {
+            items {|key, value|
+                let new_path: cell-path =  $cell_path | split cell-path | append ([$key] | into cell-path | split cell-path) | into cell-path
+                $value | _traverse $closure $structured $new_path
+                | {$key: $in}
+            }
+            | into record
+            | do $structured $in $cell_path
+		}
+		_ => { do $closure $in $cell_path }
+	}
 }
 
 # Later TODOs

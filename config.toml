@@ -1,42 +1,56 @@
+# This is the configuration file for screentimer.
+# 
+# You can disable rules by commenting out their configuration.
+# Disabling a rule will also disable other rules which depend on that rule.
+
 [config]
 
 users = [
     "username",
     "guest",
 ]
-# List of users whom screen time rules should apply.
+# List of users for whom screentime rules should apply.
 # Users not listed here remain unaffected.
+# If this option is not given, the rules apply for all users.
  
 timezone = "Europe/London"
-# Your timezone. 
-# For a full list of available timezones, run the script: ./screentimer.nu list-timezones
+# Your timezone.
+# For a full list of available timezones, you can run the command: screentimer list-timezones
 
-# offline_time = "15min"
-# Maximum allowed offline usage time per day (usage without access to real clock data fetched from google.com).
-# This is useful to prevent user modifications to OS clock affecting the blocking.
-# Comment it out to disable fetching clock data from network, and instead trust OS clock.
+[rules]
+
+
+
+offline_extra_time = "15min"
+# Maximum allowed offline usage time per day.
 # It's recommended to keep this unchanged.
 
-# after_boot_allowed = "2min"
 # Duration after system boot during which all limits are disabled.
-# Useful for connecting to Wi-Fi, logging in to institution networks, etc.
+# This is useful for e.g. connecting to Airport Wi-Fi's or logging in to institution networks.
 # It's highly recommended to keep this unchanged.
+allow_after_boot = "2min"
 
-[checks]
+# allow_schedule rule specifies the time ranges in which the user is allowed to use the computer. Outside these schedules the computer will be blocked.
+# You can specify a single range for every day or multiple ranges per day of the week.
+# This rule depends on real_time rule, because it only trusts the clock fetched from online sources.
+allow_schedule = [ "05:00 - 23:00" ]
+# allow_schedule = {
+#     monday    = ["08:00 - 19:00"],
+#     tuesday   = ["08:00 - 19:00"],
+#     wednesday = ["08:00 - 19:00"],
+#     thursday  = ["08:00 - 19:00"],
+#     friday    = ["08:00 - 19:00"],
+#     saturday  = [],
+#     sunday    = []
+# }
 
-allowed_times = [
-    "05:00 - 20:00", 
-]
-# Allowed usage time ranges during the day. You can specify multiple ranges.
-# Comment it out to disable time range based blocking.
-# Are you productive after 8pm?
-
-extra_time = "10min"
+online_extra_time = "10min"
 # Maximum extra allowed usage time per day, outside of all other limits.
-# Comment it out to disable extra time.
 
 total_time = "6hr"
 # Total allowed screen usage time per day.
 # Once this total is exceeded, further usage is blocked.
-# Comment it out to disable total time counting.
-# Are you productive after 6 hours, or is it better for you to take a walk instead?
+# Studies show that most people aren't productive after ~4-6 hours of work.
+
+real_time.enabled = true
+# This rule gets the real time clock information from google.com.
